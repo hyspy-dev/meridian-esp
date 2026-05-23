@@ -1,0 +1,17 @@
+{
+  "name": "Meridian ESP",
+  "version": "1.0.0",
+  "main": "meridian.esp.EspModule",
+  "priority": 100,
+  "updateUrl": "https://github.com/hyspy-dev/meridian-esp/releases",
+  "dependsOn": {
+    "meridian-core": ">=0.2.0"
+  },
+  "requires": {
+    "services": [
+      "meridian.core.api.EntityTracker",
+      "meridian.core.api.DebugRender",
+      "meridian.core.api.World"
+    ]
+  }
+}
