@@ -50,7 +50,7 @@ Two sections in the module's settings panel:
 - **Nearest blocks (top 100, click to share)** — read-only live list of matched
   blocks, sorted by distance. Clicking a row publishes the block position
   through `SelectionBus` — handy for piping into
-  [meridian-interaction-test](../meridian-interaction-test)'s X/Y/Z fields.
+  [meridian-interaction-examples](../meridian-interaction-examples)'s X/Y/Z fields.
 
 The toggles always start off and don't persist; the radii and the block-name
 filter survive a restart.
@@ -62,7 +62,7 @@ ESP is a publisher on `SelectionBus`:
 1. User clicks a row in the "Nearest blocks" list.
 2. ESP looks up the row's payload in its current atomic snapshot.
 3. `selectionBus.publishBlock(pos)` fans the position out to every subscriber.
-4. `meridian-interaction-test` (if loaded) writes those coordinates into its
+4. `meridian-interaction-examples` (if loaded) writes those coordinates into its
    X/Y/Z fields — ready for "Use on block", "Hit block", etc.
 
 Same shape for entity rows via `publishEntity(id)` — though no consumer for
