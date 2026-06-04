@@ -83,6 +83,7 @@ public class EspModule implements ProxyModule {
 
     // Live settings — each is mirrored from a SettingsSpec callback.
     private volatile boolean entityEnabled;
+    private volatile boolean entityPlayersOnly;
     private volatile int entityRadius = 64;
     private volatile boolean blockEnabled;
     private volatile String blockName = "";
@@ -122,6 +123,10 @@ public class EspModule implements ProxyModule {
         ctx.registerSettings(SettingsSpec.builder()
                 .section("Entity ESP", SettingsSpec.builder()
                         .bool("entityEnabled", "Enabled", false, v -> entityEnabled = v)
+                        // Restrict the box/list pass to real players (entities
+                        // the server sent a skin for) — hides mobs, props, etc.
+                        .bool("entityPlayersOnly", "Players only", false,
+                                v -> entityPlayersOnly = v)
                         // Beyond the client's view distance the server stops
                         // sending entity updates, so a huge radius costs us
                         // nothing — there's just nothing further to box.
@@ -142,7 +147,7 @@ public class EspModule implements ProxyModule {
                                 () -> blockSnapshot.rows(),
                                 this::onBlockRowClicked)
                         .build())
-                .persistent("entityRadius", "blockName", "blockRadius")
+                .persistent("entityPlayersOnly", "entityRadius", "blockName", "blockRadius")
                 .build());
 
         ctx.scheduler().scheduleAtFixedRate(this::entityTick, ENTITY_REFRESH, ENTITY_REFRESH);
@@ -219,9 +224,13 @@ public class EspModule implements ProxyModule {
         // need it both for the sorted list and for the box pass.
         record EntityHit(int id, Vec3 pos, double distSq) {}
         List<EntityHit> hits = new ArrayList<>();
+        boolean playersOnly = entityPlayersOnly;
         for (int id : entities.trackedEntities()) {
             if (self.isPresent() && self.getAsInt() == id) {
                 continue; // don't box the local player
+            }
+            if (playersOnly && !entities.isPlayer(id)) {
+                continue; // players-only mode — skip mobs, props, projectiles
             }
             Optional<Vec3> pos = entities.positionOf(id);
             if (pos.isEmpty()) {

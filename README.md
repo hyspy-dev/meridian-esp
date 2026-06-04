@@ -32,6 +32,10 @@ Two sections in the module's settings panel:
 ### Entity ESP
 
 - **Enabled** — flip on to start boxing entities (session-only — always starts off).
+- **Players only** — restrict both the boxes and the list to real players.
+  A player is any entity the server has sent a skin component for, so this is a
+  definitive filter (no model-name guessing) — mobs, props, and projectiles
+  drop out. Off by default; the choice persists across restarts.
 - **Radius** — only entities within this many blocks of the local player are
   boxed. The server stops sending entity updates past the client's view
   distance, so a huge radius costs nothing — there's just nothing further to
@@ -52,8 +56,8 @@ Two sections in the module's settings panel:
   through `SelectionBus` — handy for piping into
   [meridian-interaction-examples](../meridian-interaction-examples)'s X/Y/Z fields.
 
-The toggles always start off and don't persist; the radii and the block-name
-filter survive a restart.
+The **Enabled** toggles always start off and don't persist; the radii, the
+block-name filter, and the **Players only** toggle survive a restart.
 
 ## Cross-module flow
 
