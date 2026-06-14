@@ -85,9 +85,15 @@ public class EspModule implements ProxyModule {
     private volatile boolean entityEnabled;
     private volatile boolean entityPlayersOnly;
     private volatile int entityRadius = 64;
+    /** Max nearest entities to draw boxes for (the render budget). */
+    private volatile int entityLimit = 128;
     private volatile boolean blockEnabled;
     private volatile String blockName = "";
     private volatile int blockRadius = 16;
+
+    // Entity counts published by entityTick for the UI live-text.
+    private volatile int entitiesInRange;
+    private volatile int entitiesDrawn;
 
     // Trigger-volume ids placed in the last frame — for clean removal of
     // stale boxes when an entity vanishes or a block scrolls out of range.
@@ -130,7 +136,13 @@ public class EspModule implements ProxyModule {
                         // Beyond the client's view distance the server stops
                         // sending entity updates, so a huge radius costs us
                         // nothing — there's just nothing further to box.
-                        .int_("entityRadius", "Radius", 1, 512, 64, v -> entityRadius = v)
+                        .int_("entityRadius", "Radius", 1, 1024, 128, v -> entityRadius = v)
+                        // Render budget: how many of the nearest in-range
+                        // entities actually get a box. Caps client load on
+                        // crowded servers where hundreds are in view.
+                        .int_("entityLimit", "Render limit (nearest)", 1, 1024, 128,
+                                v -> entityLimit = v)
+                        .liveText("Entities — total / in range / drawn", this::entityCounts)
                         .liveList("Nearest entities (top " + LIST_LIMIT + ", click to share)",
                                 () -> entitySnapshot.rows(),
                                 this::onEntityRowClicked)
@@ -147,7 +159,8 @@ public class EspModule implements ProxyModule {
                                 () -> blockSnapshot.rows(),
                                 this::onBlockRowClicked)
                         .build())
-                .persistent("entityPlayersOnly", "entityRadius", "blockName", "blockRadius")
+                .persistent("entityPlayersOnly", "entityRadius", "entityLimit",
+                        "blockName", "blockRadius")
                 .build());
 
         ctx.scheduler().scheduleAtFixedRate(this::entityTick, ENTITY_REFRESH, ENTITY_REFRESH);
@@ -207,6 +220,8 @@ public class EspModule implements ProxyModule {
                 entityIds = Set.of();
             }
             if (!entitySnapshot.rows().isEmpty()) entitySnapshot = EntitySnapshot.EMPTY;
+            entitiesInRange = 0;
+            entitiesDrawn = 0;
             return;
         }
         Optional<Vec3> playerPos = entities.localPosition();
@@ -248,6 +263,10 @@ public class EspModule implements ProxyModule {
         }
         hits.sort(Comparator.comparingDouble(EntityHit::distSq));
 
+        // Render budget: draw the nearest `entityLimit` only.
+        entitiesInRange = hits.size();
+        int drawCount = Math.min(hits.size(), entityLimit);
+
         // UI snapshot: pre-formatted rows + the parallel id array clicks use.
         int rowCount = Math.min(hits.size(), LIST_LIMIT);
         List<String> rows = new ArrayList<>(rowCount);
@@ -255,8 +274,9 @@ public class EspModule implements ProxyModule {
         for (int i = 0; i < rowCount; i++) {
             EntityHit h = hits.get(i);
             rows.add(String.format(Locale.ROOT,
-                    "#%-8d  d=%6.1f  (%7.1f, %6.1f, %7.1f)",
-                    h.id, Math.sqrt(h.distSq), h.pos.x(), h.pos.y(), h.pos.z()));
+                    "#%-8d d=%6.1f  (%7.1f, %6.1f, %7.1f)  %s",
+                    h.id, Math.sqrt(h.distSq),
+                    h.pos.x(), h.pos.y(), h.pos.z(), entityLabel(h.id)));
             ids[i] = h.id;
         }
         entitySnapshot = new EntitySnapshot(List.copyOf(rows), ids);
@@ -264,6 +284,7 @@ public class EspModule implements ProxyModule {
         // Box pass — needs a live client session. List already published above
         // so the UI updates even before the session binds.
         if (debug == null || !debug.available()) {
+            entitiesDrawn = 0;
             if (!entityIds.isEmpty()) {
                 removeAll(entityIds);
                 entityIds = Set.of();
@@ -271,7 +292,9 @@ public class EspModule implements ProxyModule {
             return;
         }
         Set<String> seen = new HashSet<>();
-        for (EntityHit h : hits) {
+        // Draw only the nearest `drawCount` — `hits` is sorted by distance.
+        for (int i = 0; i < drawCount; i++) {
+            EntityHit h = hits.get(i);
             String vid = "esp_ent_" + h.id;
             seen.add(vid);
             // The tracked position is the entity's feet — lift the box centre
@@ -283,6 +306,53 @@ public class EspModule implements ProxyModule {
             if (!seen.contains(old)) debug.clearWorldBox(old);
         }
         entityIds = seen;
+        entitiesDrawn = drawCount;
+    }
+
+    /**
+     * Identifying label for the list: the nameplate (a player's username or a
+     * named entity's display name) when present, else the entity's species —
+     * the last path segment of its model path — else "?".
+     */
+    private String entityLabel(int id) {
+        String nameplate = entities.nameplateOf(id).orElse(null);
+        if (nameplate != null && !nameplate.isBlank()) {
+            return nameplate;
+        }
+        // Model asset id names the species; the mesh path is shared, so it is
+        // only a last resort.
+        String asset = entities.entityModelAssetId(id).orElse(null);
+        if (asset != null && !asset.isBlank()) {
+            return prettyType(asset);
+        }
+        String type = entities.entityTypeOf(id).orElse(null);
+        return type != null && !type.isBlank() ? prettyType(type) : "?";
+    }
+
+    /**
+     * Turns a model path into a readable species. Paths look like
+     * {@code Creatures/Cow/Model.blockymodel} or {@code Characters/Player.blockymodel}:
+     * strip the extension, and when the file name is the generic mesh
+     * ("Model") fall back to the parent folder — the species lives there.
+     */
+    private static String prettyType(String path) {
+        String[] seg = path.split("/");
+        int last = seg.length - 1;
+        String name = seg[last];
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) {
+            name = name.substring(0, dot);   // drop ".blockymodel"
+        }
+        if ((name.isEmpty() || name.equalsIgnoreCase("Model")) && last >= 1) {
+            name = seg[last - 1];            // generic mesh → use the folder name
+        }
+        return name;
+    }
+
+    /** Live-text line: total tracked vs. how many are in range and drawn. */
+    private String entityCounts() {
+        return String.format(Locale.ROOT, "Total: %d   |   in range: %d   |   drawn: %d",
+                entities.trackedCount(), entitiesInRange, entitiesDrawn);
     }
 
     /**
