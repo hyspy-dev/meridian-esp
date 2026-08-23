@@ -58,6 +58,29 @@
                     </execution>
                 </executions>
             </plugin>
+            <!-- Layer-2 guard: this module must not (accidentally) depend on meridian-protocol. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <id>layer2-no-protocol</id>
+                        <goals><goal>enforce</goal></goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <excludes>
+                                        <exclude>meridian:meridian-protocol</exclude>
+                                    </excludes>
+                                    <message>Layer-2 module must not depend on meridian-protocol (directly or transitively). If it genuinely needs raw packets it is Layer 1 — mark it "layer": 1 in module.json and drop this guard.</message>
+                                </bannedDependencies>
+                            </rules>
+                            <fail>true</fail>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 </project>
