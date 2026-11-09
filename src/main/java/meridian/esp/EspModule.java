@@ -2,18 +2,20 @@ package meridian.esp;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
-import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import meridian.api.module.ModuleContext;
 import meridian.api.module.ProxyModule;
 import meridian.api.settings.SettingsSpec;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
+import meridian.core.api.Box;
 import meridian.core.api.DebugRender;
 import meridian.core.api.EntityTracker;
 import meridian.core.api.SelectionBus;
@@ -34,12 +36,14 @@ import org.slf4j.Logger;
  *
  * <ul>
  *   <li><b>Entity ESP</b> — boxes every tracked entity within {@code radius}
- *       blocks of the local player (the player itself excluded). The box
- *       follows the entity by re-positioning on every tick (100 ms).</li>
- *   <li><b>Block ESP</b> — scans a cube of {@code radius} around the player
- *       once a second, boxes every block whose type name contains the
- *       configured filter. The scan stops at unloaded chunks, so a huge
- *       radius costs nothing past the client's view distance.</li>
+ *       blocks of the local player (the player itself excluded), each by the
+ *       hitbox the server gave its model. The box follows the entity by
+ *       re-positioning on every tick (100 ms).</li>
+ *   <li><b>Block ESP</b> — asks core once a second for the blocks within
+ *       {@code radius} of the player whose type name contains the configured
+ *       filter, nearest first, and boxes them. Core searches only what it was
+ *       sent, so a huge radius costs nothing past the client's view distance,
+ *       and finds a door or a bed once, at the cell it stands on.</li>
  * </ul>
  *
  * <h2>UI live-lists</h2>
@@ -58,6 +62,8 @@ import org.slf4j.Logger;
  */
 public class EspModule implements ProxyModule {
 
+    private static final String USAGE = "blocks <name-contains> [radius] | entities [radius] [players]";
+
     /** Entity overlay refresh period — entities move, re-position each tick. */
     private static final Duration ENTITY_REFRESH = Duration.ofMillis(100);
     /** Block overlay refresh period — blocks are static, scan less often. */
@@ -68,9 +74,14 @@ public class EspModule implements ProxyModule {
     private static final float BOX_R = 0.6f;
     private static final float BOX_G = 1.0f;
     private static final float BOX_B = 0.3f;
-    /** Entity box footprint / height, blocks (a rough humanoid hitbox). */
+    /**
+     * Entity box footprint / height, blocks, for an entity the server has given no hitbox (no
+     * model sent yet, or one without a box): a rough humanoid.
+     */
     private static final double ENT_W = 0.9;
     private static final double ENT_H = 2.0;
+    /** The most blocks one scan boxes - the nearest of them. */
+    private static final int BLOCK_LIMIT = 1024;
     /** Hard cap on rows surfaced to the UI live-lists — the lists exist to
      *  show the nearest few targets, not to dump every tracked object. */
     private static final int LIST_LIMIT = 100;
@@ -163,6 +174,13 @@ public class EspModule implements ProxyModule {
                         "blockName", "blockRadius")
                 .build());
 
+        // What the lists would show, on the proxy's command channel: esp <conn> blocks|entities ...
+        try {
+            ctx.registerCommand("esp", USAGE, (args, json) -> command(args));
+        } catch (NoSuchMethodError olderProxy) {
+            // no command channel there
+        }
+
         ctx.scheduler().scheduleAtFixedRate(this::entityTick, ENTITY_REFRESH, ENTITY_REFRESH);
         ctx.scheduler().scheduleAtFixedRate(this::blockTick, BLOCK_REFRESH, BLOCK_REFRESH);
         log.info("meridian-esp enabled — through-wall ESP via DebugRender.worldBox");
@@ -203,6 +221,12 @@ public class EspModule implements ProxyModule {
                 p.x(), p.y(), p.z());
     }
 
+    /** An entity in range, with its squared distance from the player. */
+    private record EntityHit(int id, Vec3 pos, double distSq) {}
+
+    /** A matched block, with its squared distance from the player (to the block's centre). */
+    private record BlockHit(int x, int y, int z, String name, double distSq) {}
+
     /**
      * Re-positions a through-wall box on every tracked entity within the
      * configured radius and refreshes the UI live-list snapshot. Boxes are
@@ -230,38 +254,9 @@ public class EspModule implements ProxyModule {
             // know where the player is.
             return;
         }
-        Vec3 pp = playerPos.get();
-        OptionalInt self = entities.localEntityId();
-        double r = entityRadius;
-        double r2 = r * r;
-
-        // Collect every in-range entity once, with its squared distance — we
-        // need it both for the sorted list and for the box pass.
-        record EntityHit(int id, Vec3 pos, double distSq) {}
-        List<EntityHit> hits = new ArrayList<>();
-        boolean playersOnly = entityPlayersOnly;
-        for (int id : entities.trackedEntities()) {
-            if (self.isPresent() && self.getAsInt() == id) {
-                continue; // don't box the local player
-            }
-            if (playersOnly && !entities.isPlayer(id)) {
-                continue; // players-only mode — skip mobs, props, projectiles
-            }
-            Optional<Vec3> pos = entities.positionOf(id);
-            if (pos.isEmpty()) {
-                continue;
-            }
-            Vec3 p = pos.get();
-            double dx = p.x() - pp.x();
-            double dy = p.y() - pp.y();
-            double dz = p.z() - pp.z();
-            double dSq = dx * dx + dy * dy + dz * dz;
-            if (dSq > r2) {
-                continue;
-            }
-            hits.add(new EntityHit(id, p, dSq));
-        }
-        hits.sort(Comparator.comparingDouble(EntityHit::distSq));
+        // Every in-range entity once — we need it both for the sorted list and
+        // for the box pass.
+        List<EntityHit> hits = entitiesNear(playerPos.get(), entityRadius, entityPlayersOnly);
 
         // Render budget: draw the nearest `entityLimit` only.
         entitiesInRange = hits.size();
@@ -273,10 +268,7 @@ public class EspModule implements ProxyModule {
         int[] ids = new int[rowCount];
         for (int i = 0; i < rowCount; i++) {
             EntityHit h = hits.get(i);
-            rows.add(String.format(Locale.ROOT,
-                    "#%-8d d=%6.1f  (%7.1f, %6.1f, %7.1f)  %s",
-                    h.id, Math.sqrt(h.distSq),
-                    h.pos.x(), h.pos.y(), h.pos.z(), entityLabel(h.id)));
+            rows.add(entityRow(h));
             ids[i] = h.id;
         }
         entitySnapshot = new EntitySnapshot(List.copyOf(rows), ids);
@@ -297,10 +289,10 @@ public class EspModule implements ProxyModule {
             EntityHit h = hits.get(i);
             String vid = "esp_ent_" + h.id;
             seen.add(vid);
-            // The tracked position is the entity's feet — lift the box centre
-            // to mid-height so the outline wraps the whole body.
-            debug.worldBox(vid, h.pos.x(), h.pos.y() + ENT_H / 2.0, h.pos.z(),
-                    ENT_W, ENT_H, ENT_W, BOX_R, BOX_G, BOX_B, OPACITY);
+            Box b = entityBox(h);
+            Vec3 c = b.center();
+            debug.worldBox(vid, c.x(), c.y(), c.z(), b.width(), b.height(), b.depth(),
+                    BOX_R, BOX_G, BOX_B, OPACITY);
         }
         for (String old : entityIds) {
             if (!seen.contains(old)) debug.clearWorldBox(old);
@@ -310,43 +302,37 @@ public class EspModule implements ProxyModule {
     }
 
     /**
-     * Identifying label for the list: the nameplate (a player's username or a
-     * named entity's display name) when present, else the entity's species —
-     * the last path segment of its model path — else "?".
+     * The entities within {@code radius} of the player at {@code pp}, nearest first - the local
+     * player left out, and in players-only mode the mobs, props and projectiles.
      */
-    private String entityLabel(int id) {
-        String nameplate = entities.nameplateOf(id).orElse(null);
-        if (nameplate != null && !nameplate.isBlank()) {
-            return nameplate;
+    private List<EntityHit> entitiesNear(Vec3 pp, int radius, boolean playersOnly) {
+        List<EntityHit> hits = new ArrayList<>();
+        for (int id : entities.nearby(radius, playersOnly)) {
+            Optional<Vec3> pos = entities.positionOf(id);
+            if (pos.isEmpty()) {
+                continue;               // gone since the list was made
+            }
+            hits.add(new EntityHit(id, pos.get(), pos.get().distanceSqTo(pp)));
         }
-        // Model asset id names the species; the mesh path is shared, so it is
-        // only a last resort.
-        String asset = entities.entityModelAssetId(id).orElse(null);
-        if (asset != null && !asset.isBlank()) {
-            return prettyType(asset);
-        }
-        String type = entities.entityTypeOf(id).orElse(null);
-        return type != null && !type.isBlank() ? prettyType(type) : "?";
+        return hits;
+    }
+
+    /** An entity's row in the list. */
+    private String entityRow(EntityHit h) {
+        return String.format(Locale.ROOT,
+                "#%-8d d=%6.1f  (%7.1f, %6.1f, %7.1f)  %s",
+                h.id, Math.sqrt(h.distSq),
+                h.pos.x(), h.pos.y(), h.pos.z(), entities.labelOf(h.id));
     }
 
     /**
-     * Turns a model path into a readable species. Paths look like
-     * {@code Creatures/Cow/Model.blockymodel} or {@code Characters/Player.blockymodel}:
-     * strip the extension, and when the file name is the generic mesh
-     * ("Model") fall back to the parent folder — the species lives there.
+     * The box drawn on an entity: the hitbox the server gave its model, else - no model sent yet,
+     * or one without a box - a rough humanoid standing on the entity's feet.
      */
-    private static String prettyType(String path) {
-        String[] seg = path.split("/");
-        int last = seg.length - 1;
-        String name = seg[last];
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            name = name.substring(0, dot);   // drop ".blockymodel"
-        }
-        if ((name.isEmpty() || name.equalsIgnoreCase("Model")) && last >= 1) {
-            name = seg[last - 1];            // generic mesh → use the folder name
-        }
-        return name;
+    private Box entityBox(EntityHit h) {
+        return entities.boundsOf(h.id).orElseGet(() -> new Box(
+                new Vec3(h.pos.x() - ENT_W / 2, h.pos.y(), h.pos.z() - ENT_W / 2),
+                new Vec3(h.pos.x() + ENT_W / 2, h.pos.y() + ENT_H, h.pos.z() + ENT_W / 2)));
     }
 
     /** Live-text line: total tracked vs. how many are in range and drawn. */
@@ -356,12 +342,12 @@ public class EspModule implements ProxyModule {
     }
 
     /**
-     * Scans the configured cube around the player, sorts matches by distance,
+     * Finds the matching blocks around the player through core, nearest first,
      * updates the UI live-list, and boxes them.
      *
-     * <p>The whole pass — scan + list build + box draw — is gated by the Block
+     * <p>The whole pass — search + list build + box draw — is gated by the Block
      * ESP toggle. When it's off, or with an empty name filter, both the list
-     * and the boxes go silent and the (otherwise O(r³)) scan is skipped.
+     * and the boxes go silent and the search is skipped.
      */
     private void blockTick() {
         String needle = blockName;
@@ -377,62 +363,9 @@ public class EspModule implements ProxyModule {
         if (playerPos.isEmpty()) {
             return;
         }
-        Vec3 p = playerPos.get();
-        double pcx = p.x();
-        double pcy = p.y();
-        double pcz = p.z();
-        int px = (int) Math.floor(pcx);
-        int py = (int) Math.floor(pcy);
-        int pz = (int) Math.floor(pcz);
-        int r = blockRadius;
-
-        // Collect every name-matched block in range with its squared distance
-        // from the player (block centre). Same record used to drive both the
-        // sorted UI list and the box pass.
-        record BlockHit(int x, int y, int z, String name, double distSq) {}
-        List<BlockHit> hits = new ArrayList<>();
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dz = -r; dz <= r; dz++) {
-                for (int dy = -r; dy <= r; dy++) {
-                    Block block = world.blockAt(px + dx, py + dy, pz + dz);
-                    if (block.isAir() || block.type() == null
-                            || block.type().name() == null) {
-                        continue;
-                    }
-                    String name = block.type().name();
-                    if (!name.contains(needle)) {
-                        continue;
-                    }
-                    double cx = block.x() + 0.5 - pcx;
-                    double cy = block.y() + 0.5 - pcy;
-                    double cz = block.z() + 0.5 - pcz;
-                    hits.add(new BlockHit(block.x(), block.y(), block.z(),
-                            name, cx * cx + cy * cy + cz * cz));
-                }
-            }
-        }
-        hits.sort(Comparator.comparingDouble(BlockHit::distSq));
-
-        // UI snapshot — pad the type-name column to the widest match (capped)
-        // so the distance/coordinate columns line up. Parallel positions list
-        // is what row clicks resolve through.
-        int rowCount = Math.min(hits.size(), LIST_LIMIT);
-        int nameWidth = 0;
-        for (int i = 0; i < rowCount; i++) {
-            int len = hits.get(i).name.length();
-            if (len > nameWidth) nameWidth = len;
-        }
-        if (nameWidth > 32) nameWidth = 32;
-        List<String> rows = new ArrayList<>(rowCount);
-        List<BlockPos> positions = new ArrayList<>(rowCount);
-        for (int i = 0; i < rowCount; i++) {
-            BlockHit h = hits.get(i);
-            rows.add(String.format(Locale.ROOT,
-                    "%-" + nameWidth + "s  d=%6.1f  (%6d, %4d, %6d)",
-                    h.name, Math.sqrt(h.distSq), h.x, h.y, h.z));
-            positions.add(new BlockPos(h.x, h.y, h.z));
-        }
-        blockSnapshot = new BlockSnapshot(List.copyOf(rows), List.copyOf(positions));
+        // Same hits drive both the sorted UI list and the box pass.
+        List<BlockHit> hits = blocksNear(playerPos.get(), needle, blockRadius);
+        blockSnapshot = blockSnapshotOf(hits);
 
         // Box pass — needs a live client session. List already published above.
         if (debug == null || !debug.available()) {
@@ -458,6 +391,88 @@ public class EspModule implements ProxyModule {
             if (!seen.contains(old)) debug.clearWorldBox(old);
         }
         blockIds = seen;
+    }
+
+    /**
+     * Every block within {@code radius} of the feet at {@code p} whose type name contains
+     * {@code needle} (case counts), nearest first, at most {@link #BLOCK_LIMIT}.
+     */
+    private List<BlockHit> blocksNear(Vec3 p, String needle, int radius) {
+        List<BlockHit> hits = new ArrayList<>();
+        for (Block block : world.find(p, radius,
+                t -> t.name() != null && t.name().contains(needle), BLOCK_LIMIT)) {
+            double cx = block.x() + 0.5 - p.x();
+            double cy = block.y() + 0.5 - p.y();
+            double cz = block.z() + 0.5 - p.z();
+            hits.add(new BlockHit(block.x(), block.y(), block.z(),
+                    block.type().name(), cx * cx + cy * cy + cz * cz));
+        }
+        return hits;
+    }
+
+    /**
+     * The list's rows for the nearest {@link #LIST_LIMIT} blocks — the type-name column padded to
+     * the widest match (capped) so the distance/coordinate columns line up — with the parallel
+     * positions list row clicks resolve through.
+     */
+    private static BlockSnapshot blockSnapshotOf(List<BlockHit> hits) {
+        int rowCount = Math.min(hits.size(), LIST_LIMIT);
+        int nameWidth = 0;
+        for (int i = 0; i < rowCount; i++) {
+            int len = hits.get(i).name.length();
+            if (len > nameWidth) nameWidth = len;
+        }
+        if (nameWidth > 32) nameWidth = 32;
+        List<String> rows = new ArrayList<>(rowCount);
+        List<BlockPos> positions = new ArrayList<>(rowCount);
+        for (int i = 0; i < rowCount; i++) {
+            BlockHit h = hits.get(i);
+            rows.add(String.format(Locale.ROOT,
+                    "%-" + nameWidth + "s  d=%6.1f  (%6d, %4d, %6d)",
+                    h.name, Math.sqrt(h.distSq), h.x, h.y, h.z));
+            positions.add(new BlockPos(h.x, h.y, h.z));
+        }
+        return new BlockSnapshot(List.copyOf(rows), List.copyOf(positions));
+    }
+
+    /**
+     * {@code blocks <name> [radius]} and {@code entities [radius] [players]}: what the lists would
+     * show around the player now, with each entity's box - whether or not ESP is on.
+     */
+    private CompletableFuture<?> command(List<String> args) {
+        if (args.isEmpty()) {
+            throw new IllegalArgumentException(USAGE);
+        }
+        Vec3 p = entities.localPosition().orElseThrow(() -> new IllegalStateException("no position yet"));
+        switch (args.get(0).toLowerCase(Locale.ROOT)) {
+            case "blocks" -> {
+                if (args.size() < 2) {
+                    throw new IllegalArgumentException(USAGE);
+                }
+                int radius = args.size() > 2 ? Integer.parseInt(args.get(2)) : blockRadius;
+                List<BlockHit> hits = blocksNear(p, args.get(1), radius);
+                BlockSnapshot s = blockSnapshotOf(hits);
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("found", hits.size());
+                out.put("rows", s.rows());
+                out.put("positions", s.positions());
+                return CompletableFuture.completedFuture(out);
+            }
+            case "entities" -> {
+                int radius = args.size() > 1 ? Integer.parseInt(args.get(1)) : entityRadius;
+                boolean players = args.size() > 2 && args.get(2).equalsIgnoreCase("players");
+                List<Map<String, Object>> out = new ArrayList<>();
+                for (EntityHit h : entitiesNear(p, radius, players)) {
+                    Map<String, Object> e = new LinkedHashMap<>();
+                    e.put("id", h.id);
+                    e.put("row", entityRow(h));
+                    e.put("box", entityBox(h));
+                    out.add(e);
+                }
+                return CompletableFuture.completedFuture(out);
+            }
+            default -> throw new IllegalArgumentException(USAGE);
+        }
     }
 
     private void removeAll(Set<String> ids) {
