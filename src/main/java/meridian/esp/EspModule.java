@@ -16,7 +16,9 @@ import meridian.api.settings.SettingsSpec;
 import meridian.core.api.Block;
 import meridian.core.api.BlockPos;
 import meridian.core.api.Box;
+import meridian.core.api.Combat;
 import meridian.core.api.DebugRender;
+import meridian.core.api.EntityLabels;
 import meridian.core.api.EntityTracker;
 import meridian.core.api.SelectionBus;
 import meridian.core.api.Vec3;
@@ -62,7 +64,8 @@ import org.slf4j.Logger;
  */
 public class EspModule implements ProxyModule {
 
-    private static final String USAGE = "blocks <name-contains> [radius] | entities [radius] [players]";
+    private static final String USAGE = "blocks <name-contains> [radius] | entities [radius] [players] | "
+            + "mark off|Boxes|Labels|Both [Name|Health]";
 
     /** Entity overlay refresh period — entities move, re-position each tick. */
     private static final Duration ENTITY_REFRESH = Duration.ofMillis(100);
@@ -91,10 +94,31 @@ public class EspModule implements ProxyModule {
     private DebugRender debug;
     private World world;
     private SelectionBus selectionBus;
+    /** Texts over entities, drawn over walls; absent on an older core (boxes only then). */
+    private EntityLabels labels;
+    /** Who has hit the player lately (their labels red); absent on an older core. */
+    private Combat combat;
+
+    /** What marks an entity. */
+    public enum Mode { Boxes, Labels, Both }
+
+    /** What a label says, after the distance in metres. */
+    public enum LabelText { Name, Health }
+
+    /** A hit within this long ago makes the hitter's label red. */
+    private static final Duration HIT_RECENT = Duration.ofSeconds(5);
 
     // Live settings — each is mirrored from a SettingsSpec callback.
     private volatile boolean entityEnabled;
     private volatile boolean entityPlayersOnly;
+    private volatile Mode entityMode = Mode.Boxes;
+    private volatile LabelText labelText = LabelText.Name;
+    private volatile int colorPlayer = 0xFF66CCFF;
+    private volatile int colorMob = 0xFFFF9933;
+    private volatile int colorItem = 0xFFFFFFFF;
+    private volatile int colorHitter = 0xFFFF3333;
+    /** Entities given a label in the last frame - to take down what is no longer drawn. */
+    private Set<Integer> labelled = Set.of();
     private volatile int entityRadius = 64;
     /** Max nearest entities to draw boxes for (the render budget). */
     private volatile int entityLimit = 128;
@@ -133,6 +157,8 @@ public class EspModule implements ProxyModule {
         this.world = ctx.services().require(World.class);
         // Soft dependency — keep working with an older core that lacks the bus.
         this.selectionBus = ctx.services().get(SelectionBus.class).orElse(null);
+        this.labels = ctx.services().get(EntityLabels.class).orElse(null);
+        this.combat = ctx.services().get(Combat.class).orElse(null);
 
         // Toggles always start off — ESP is a deliberate action, not something
         // to silently resume after a restart. Radii and the block-name filter
@@ -153,6 +179,20 @@ public class EspModule implements ProxyModule {
                         // crowded servers where hundreds are in view.
                         .int_("entityLimit", "Render limit (nearest)", 1, 1024, 128,
                                 v -> entityLimit = v)
+                        // Labels: a short text over each, drawn over walls by the game itself
+                        // (about 12 characters show). Needs a core that has EntityLabels.
+                        .enum_("entityMode", "Mark with", Mode.class, Mode.Boxes, v -> entityMode = v)
+                        .enum_("labelText", "Label: metres and", LabelText.class, LabelText.Name,
+                                v -> labelText = v)
+                        .int_("labelFont", "Label size", 8, 48, 18, v -> {
+                            if (labels != null) {
+                                labels.fontSize(v);
+                            }
+                        })
+                        .color("colorPlayer", "Label: players", 0xFF66CCFF, v -> colorPlayer = v)
+                        .color("colorMob", "Label: mobs and NPCs", 0xFFFF9933, v -> colorMob = v)
+                        .color("colorItem", "Label: items on the ground", 0xFFFFFFFF, v -> colorItem = v)
+                        .color("colorHitter", "Label: who hit you (5 s)", 0xFFFF3333, v -> colorHitter = v)
                         .liveText("Entities — total / in range / drawn", this::entityCounts)
                         .liveList("Nearest entities (top " + LIST_LIMIT + ", click to share)",
                                 () -> entitySnapshot.rows(),
@@ -170,7 +210,8 @@ public class EspModule implements ProxyModule {
                                 () -> blockSnapshot.rows(),
                                 this::onBlockRowClicked)
                         .build())
-                .persistent("entityPlayersOnly", "entityRadius", "entityLimit",
+                .persistent("entityPlayersOnly", "entityRadius", "entityLimit", "entityMode", "labelText",
+                        "labelFont", "colorPlayer", "colorMob", "colorItem", "colorHitter",
                         "blockName", "blockRadius")
                 .build());
 
@@ -190,6 +231,9 @@ public class EspModule implements ProxyModule {
     public void onDisable() {
         entityEnabled = false;
         blockEnabled = false;
+        if (labels != null) {
+            labels.clear();
+        }
         if (debug != null && debug.available()) {
             for (String id : entityIds) debug.clearWorldBox(id);
             for (String id : blockIds) debug.clearWorldBox(id);
@@ -243,6 +287,7 @@ public class EspModule implements ProxyModule {
                 removeAll(entityIds);
                 entityIds = Set.of();
             }
+            hideLabels(Set.of());
             if (!entitySnapshot.rows().isEmpty()) entitySnapshot = EntitySnapshot.EMPTY;
             entitiesInRange = 0;
             entitiesDrawn = 0;
@@ -283,9 +328,19 @@ public class EspModule implements ProxyModule {
             }
             return;
         }
+        Mode mode = labels == null ? Mode.Boxes : entityMode;
+        Set<Integer> labelling = new HashSet<>();
+        if (mode != Mode.Boxes && labels.available()) {
+            for (int i = 0; i < drawCount; i++) {
+                EntityHit h = hits.get(i);
+                labels.show(h.id, labelOf(h), labelColor(h.id) & 0xFFFFFF);
+                labelling.add(h.id);
+            }
+        }
+        hideLabels(labelling);
         Set<String> seen = new HashSet<>();
         // Draw only the nearest `drawCount` — `hits` is sorted by distance.
-        for (int i = 0; i < drawCount; i++) {
+        for (int i = 0; i < (mode == Mode.Labels ? 0 : drawCount); i++) {
             EntityHit h = hits.get(i);
             String vid = "esp_ent_" + h.id;
             seen.add(vid);
@@ -318,6 +373,40 @@ public class EspModule implements ProxyModule {
     }
 
     /** An entity's row in the list. */
+    /** The labels of the last frame not given again in this one taken down. */
+    private void hideLabels(Set<Integer> now) {
+        if (labels != null) {
+            for (int id : labelled) {
+                if (!now.contains(id)) {
+                    labels.hide(id);
+                }
+            }
+        }
+        labelled = now;
+    }
+
+    /** Metres first: the game shows about 12 characters, so the end is what gets cut. */
+    private String labelOf(EntityHit h) {
+        long metres = Math.round(Math.sqrt(h.distSq));
+        if (labelText == LabelText.Health) {
+            Optional<EntityTracker.Stat> health = entities.healthOf(h.id);
+            if (health.isPresent()) {
+                return metres + " " + Math.round(health.get().value()) + "/" + Math.round(health.get().max());
+            }
+        }
+        return metres + " " + entities.labelOf(h.id);
+    }
+
+    private int labelColor(int id) {
+        if (combat != null && combat.hitBy(id, HIT_RECENT)) {
+            return colorHitter;
+        }
+        if (entities.isPlayer(id)) {
+            return colorPlayer;
+        }
+        return entities.itemOf(id).isPresent() ? colorItem : colorMob;
+    }
+
     private String entityRow(EntityHit h) {
         return String.format(Locale.ROOT,
                 "#%-8d d=%6.1f  (%7.1f, %6.1f, %7.1f)  %s",
@@ -445,6 +534,23 @@ public class EspModule implements ProxyModule {
         }
         Vec3 p = entities.localPosition().orElseThrow(() -> new IllegalStateException("no position yet"));
         switch (args.get(0).toLowerCase(Locale.ROOT)) {
+            case "mark" -> {
+                // The entity pass switched from outside the window, as its settings would.
+                String how = args.size() > 1 ? args.get(1) : "";
+                entityEnabled = !how.equalsIgnoreCase("off");
+                if (entityEnabled) {
+                    entityMode = Mode.valueOf(how);
+                }
+                if (args.size() > 2) {
+                    labelText = LabelText.valueOf(args.get(2));
+                }
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("enabled", entityEnabled);
+                out.put("mode", entityMode.name());
+                out.put("labelled", labelled.size());
+                out.put("labels", labels != null);
+                return CompletableFuture.completedFuture(out);
+            }
             case "blocks" -> {
                 if (args.size() < 2) {
                     throw new IllegalArgumentException(USAGE);
